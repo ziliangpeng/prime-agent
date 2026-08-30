@@ -1,0 +1,1 @@
+- Added xAI (Grok) OAuth login (device code flow) for SuperGrok / Premium+ accounts: `prime-agent` and then `/login` -> xAI. Access tokens refresh automatically and rotate their refresh token; requires a subscription tier entitled to xAI API access.
