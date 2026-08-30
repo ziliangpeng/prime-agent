@@ -1,0 +1,1 @@
+- Added an opt-in built-in Datadog extension that emits per-API-call token counts and request duration as DogStatsD metrics (enable with PRIME_AGENT_DATADOG_METRICS=1).
