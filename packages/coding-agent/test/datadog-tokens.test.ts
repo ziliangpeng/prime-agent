@@ -1,6 +1,10 @@
 import { createSocket, type RemoteInfo } from "node:dgram";
 import { afterEach, describe, expect, it } from "vitest";
-import { createDatadogTokensExtension, createDogStatsDClient } from "../src/core/extensions/builtin/datadog-tokens.js";
+import {
+	createDatadogTokensExtension,
+	createDogStatsDClient,
+	parsePortEnv,
+} from "../src/core/extensions/builtin/datadog-tokens.js";
 import type { ExtensionAPI } from "../src/core/extensions/types.js";
 
 interface CapturedPacket {
@@ -110,6 +114,40 @@ describe("createDogStatsDClient", () => {
 	it("returns null when disabled", () => {
 		expect(createDogStatsDClient(false, "127.0.0.1", 8125)).toBeNull();
 	});
+
+	it("does not throw when sending after close", () => {
+		const client = createDogStatsDClient(true, "127.0.0.1", 8125);
+		expect(client).not.toBeNull();
+		client?.close();
+		expect(() => client?.send("prime.api.calls:1|c")).not.toThrow();
+	});
+});
+
+describe("parsePortEnv", () => {
+	const prev = { ...process.env };
+	afterEach(() => {
+		process.env = { ...prev };
+	});
+
+	it("falls back when unset", () => {
+		delete process.env.TEST_DD_PORT;
+		expect(parsePortEnv("TEST_DD_PORT", 8125)).toBe(8125);
+	});
+
+	it("parses valid ports", () => {
+		process.env.TEST_DD_PORT = "9999";
+		expect(parsePortEnv("TEST_DD_PORT", 8125)).toBe(9999);
+	});
+
+	it("falls back on malformed values", () => {
+		process.env.TEST_DD_PORT = "not-a-port";
+		expect(parsePortEnv("TEST_DD_PORT", 8125)).toBe(8125);
+	});
+
+	it("falls back on out-of-range values", () => {
+		process.env.TEST_DD_PORT = "99999";
+		expect(parsePortEnv("TEST_DD_PORT", 8125)).toBe(8125);
+	});
 });
 
 describe("datadog-tokens extension", () => {
@@ -214,6 +252,89 @@ describe("datadog-tokens extension", () => {
 		// Zero token counters are skipped; api.calls and the (positive) duration
 		// histogram still go out.
 		expect(collector.packets.map((p) => p.metric).sort()).toEqual(["prime.api.calls", "prime.api.duration_ms"]);
+	});
+
+	it("skips token counters for aborted messages but counts the attempt", async () => {
+		collector = await startUdpCollector();
+		process.env.PRIME_AGENT_DATADOG_METRICS = "1";
+		process.env.PRIME_AGENT_DATADOG_AGENT_PORT = String(collector.port);
+
+		const { pi, handlers } = createMockPi();
+		createDatadogTokensExtension()(pi);
+		const handler = handlers.get("message_end")?.[0];
+
+		await handler?.(
+			{
+				type: "message_end",
+				message: assistantMessage({
+					stopReason: "aborted",
+					usage: { input: 100, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 105 },
+				}),
+			},
+			{} as never,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		await collector.waitForPackets(2);
+
+		const metrics = collector.packets.map((p) => p.metric).sort();
+		expect(metrics).toEqual(["prime.api.calls", "prime.api.duration_ms"]);
+	});
+
+	it("emits nothing for non-assistant messages", async () => {
+		collector = await startUdpCollector();
+		process.env.PRIME_AGENT_DATADOG_METRICS = "1";
+		process.env.PRIME_AGENT_DATADOG_AGENT_PORT = String(collector.port);
+
+		const { pi, handlers } = createMockPi();
+		createDatadogTokensExtension()(pi);
+		const handler = handlers.get("message_end")?.[0];
+
+		await handler?.(
+			{ type: "message_end", message: { role: "user", content: [{ type: "text", text: "hi" }] } },
+			{} as never,
+		);
+		await handler?.(
+			{
+				type: "message_end",
+				message: { role: "toolResult", toolCallId: "x", toolName: "y", content: [], isError: false },
+			},
+			{} as never,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+
+		expect(collector.packets).toEqual([]);
+	});
+
+	it("stops emitting after session_shutdown closes the client", async () => {
+		collector = await startUdpCollector();
+		process.env.PRIME_AGENT_DATADOG_METRICS = "1";
+		process.env.PRIME_AGENT_DATADOG_AGENT_PORT = String(collector.port);
+
+		const { pi, handlers } = createMockPi();
+		createDatadogTokensExtension()(pi);
+		const messageEnd = handlers.get("message_end")?.[0];
+		const shutdown = handlers.get("session_shutdown")?.[0];
+
+		await shutdown?.({ type: "session_shutdown" } as never, {} as never);
+		expect(() => messageEnd?.({ type: "message_end", message: assistantMessage() }, {} as never)).not.toThrow();
+		await new Promise((resolve) => setTimeout(resolve, 100));
+
+		expect(collector.packets).toEqual([]);
+	});
+
+	it("delivers all metrics for one message", async () => {
+		collector = await startUdpCollector();
+		process.env.PRIME_AGENT_DATADOG_METRICS = "1";
+		process.env.PRIME_AGENT_DATADOG_AGENT_PORT = String(collector.port);
+
+		const { pi, handlers } = createMockPi();
+		createDatadogTokensExtension()(pi);
+		const handler = handlers.get("message_end")?.[0];
+
+		await handler?.({ type: "message_end", message: assistantMessage() }, {} as never);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		await collector.waitForPackets(7);
+		expect(collector.packets.length).toBe(7);
 	});
 
 	it("never throws from the message_end handler", async () => {
