@@ -32,7 +32,7 @@ Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party h
 
 ### xAI (Grok SuperGrok / Premium+)
 
-xAI subscription auth uses the OAuth device code flow: `/login` -> xAI opens a verification URL, approve it in the browser, and the returned token is used against `https://api.x.ai/v1`. xAI requires a subscription tier entitled to API access; if refresh returns HTTP 403, the account is tier-gated — use `XAI_API_KEY` instead.
+xAI subscription auth uses the OAuth device code flow: `/login` -> xAI opens a verification URL, approve it in the browser, and the returned token is used against `https://api.x.ai/v1`. xAI requires a subscription tier entitled to API access; if refresh returns HTTP 403, the account is tier-gated — run `/logout` to remove the xAI credentials and use `XAI_API_KEY` instead (stored OAuth credentials take priority over the environment variable).
 
 ### GitHub Copilot
 

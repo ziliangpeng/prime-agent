@@ -247,3 +247,198 @@ describe("xAI token refresh", () => {
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 });
+
+describe("xAI device flow error handling", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.useRealTimers();
+	});
+
+	function deviceResponse() {
+		return jsonResponse({
+			device_code: "device-code",
+			user_code: "ABCD-EFGH",
+			verification_uri: "https://auth.x.ai/device",
+			interval: 1,
+			expires_in: 900,
+		});
+	}
+
+	it("throws immediately for a terminal OAuth error delivered as 200+JSON", async () => {
+		vi.useFakeTimers();
+		const polls: number[] = [];
+		const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/oauth2/device/code")) return deviceResponse();
+			if (url.endsWith("/oauth2/token")) {
+				polls.push(Date.now());
+				return jsonResponse({ error: "access_denied", error_description: "user denied" });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const captured = loginXai({ onAuth: vi.fn() }).then(
+			() => new Error("expected rejection"),
+			(error: Error) => error,
+		);
+		await vi.advanceTimersByTimeAsync(10_000);
+		const error = await captured;
+		expect((error as Error).message).toContain("access_denied");
+		expect((error as Error).message).toContain("user denied");
+		expect(polls).toHaveLength(1);
+	});
+
+	it("throws immediately for a terminal OAuth error delivered as HTTP 400+JSON", async () => {
+		vi.useFakeTimers();
+		const polls: number[] = [];
+		const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/oauth2/device/code")) return deviceResponse();
+			if (url.endsWith("/oauth2/token")) {
+				polls.push(Date.now());
+				return jsonResponse({ error: "expired_token" }, 400);
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const captured = loginXai({ onAuth: vi.fn() }).then(
+			() => new Error("expected rejection"),
+			(error: Error) => error,
+		);
+		await vi.advanceTimersByTimeAsync(10_000);
+		const error = await captured;
+		expect((error as Error).message).toContain("expired_token");
+		expect(polls).toHaveLength(1);
+	});
+
+	it("treats non-JSON HTTP 500 responses as transient and keeps polling", async () => {
+		vi.useFakeTimers();
+		const polls: number[] = [];
+		const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/oauth2/device/code")) return deviceResponse();
+			if (url.endsWith("/oauth2/token")) {
+				polls.push(Date.now());
+				if (polls.length === 1) {
+					return new Response("<html>proxy error</html>", { status: 500 });
+				}
+				return jsonResponse({ access_token: "xai-access", refresh_token: "xai-refresh", expires_in: 3600 });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const promise = loginXai({ onAuth: vi.fn() });
+		await vi.advanceTimersByTimeAsync(10_000);
+		const credentials = await promise;
+		expect(credentials.access).toBe("xai-access");
+		expect(polls.length).toBe(2);
+	});
+
+	it("reports a timeout when polling never succeeds before the deadline", async () => {
+		vi.useFakeTimers();
+		const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/oauth2/device/code")) return deviceResponse();
+			return jsonResponse({ error: "authorization_pending" });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const captured = loginXai({ onAuth: vi.fn() }).then(
+			() => new Error("expected rejection"),
+			(error: Error) => error,
+		);
+		await vi.advanceTimersByTimeAsync(900_000);
+		const error = await captured;
+		expect((error as Error).message).toContain("timed out");
+	});
+
+	it("surfaces cancellation as 'Login cancelled' when aborted mid-fetch", async () => {
+		vi.useFakeTimers();
+		const controller = new AbortController();
+		const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/oauth2/device/code")) return deviceResponse();
+			if (url.endsWith("/oauth2/token")) {
+				// Abort while the fetch is in flight.
+				controller.abort();
+				throw new DOMException("This operation was aborted", "AbortError");
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const captured = loginXai({ onAuth: vi.fn(), signal: controller.signal }).then(
+			() => new Error("expected rejection"),
+			(error: Error) => error,
+		);
+		await vi.advanceTimersByTimeAsync(10_000);
+		const error = await captured;
+		expect((error as Error).message).toBe("Login cancelled");
+	});
+
+	it("widens the interval after slow_down even when the server echo is smaller", async () => {
+		vi.useFakeTimers();
+		const pollTimes: number[] = [];
+		let lastPoll = Date.now();
+		const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/oauth2/device/code")) return deviceResponse();
+			if (url.endsWith("/oauth2/token")) {
+				const now = Date.now();
+				pollTimes.push(now - lastPoll);
+				lastPoll = now;
+				if (pollTimes.length === 1) {
+					// Malformed hint: interval smaller than the original.
+					return jsonResponse({ error: "slow_down", interval: 1 });
+				}
+				return jsonResponse({ access_token: "xai-access", refresh_token: "xai-refresh", expires_in: 3600 });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const promise = loginXai({ onAuth: vi.fn() });
+		await vi.advanceTimersByTimeAsync(30_000);
+		await promise;
+		// interval starts at 1s; slow_down must add at least 5s -> >=6s gap.
+		expect(pollTimes[0]).toBeGreaterThanOrEqual(1000);
+		expect(pollTimes[1]).toBeGreaterThanOrEqual(6000);
+	});
+
+	it("rejects a verification URI from a foreign origin", async () => {
+		const fetchMock = vi.fn(async (input: unknown, _init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/oauth2/device/code")) {
+				return jsonResponse({
+					device_code: "device-code",
+					user_code: "ABCD-EFGH",
+					verification_uri: "https://evil.example.com/device",
+					interval: 1,
+					expires_in: 900,
+				});
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(loginXai({ onAuth: vi.fn() })).rejects.toThrow("unexpected verification URL");
+	});
+});
+
+describe("xAI token refresh validation", () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
+	it("rejects a refresh response without a valid expires_in", async () => {
+		const fetchMock = vi.fn(
+			async (): Promise<Response> => jsonResponse({ access_token: "new-access", refresh_token: "new-refresh" }),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(refreshXaiToken("old-refresh")).rejects.toThrow("expires_in");
+	});
+});

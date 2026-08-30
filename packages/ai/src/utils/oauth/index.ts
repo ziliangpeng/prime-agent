@@ -121,8 +121,11 @@ export async function getOAuthApiKey(
 	if (Date.now() >= creds.expires) {
 		try {
 			creds = await provider.refreshToken(creds);
-		} catch (_error) {
-			throw new Error(`Failed to refresh OAuth token for ${providerId}`);
+		} catch (error) {
+			// Keep the provider's detailed refresh error (tier gates, re-login
+			// hints, server response) attached so callers can surface it.
+			const reason = error instanceof Error ? error.message : String(error);
+			throw new Error(`Failed to refresh OAuth token for ${providerId}: ${reason}`, { cause: error });
 		}
 	}
 

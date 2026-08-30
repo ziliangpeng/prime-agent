@@ -165,11 +165,12 @@ async function pollForToken(
 			throw new Error("Login cancelled");
 		}
 
-		await abortableSleep(intervalMs, signal);
+		// Never sleep past the deadline (mirrors the copilot poll loop).
+		await abortableSleep(Math.min(intervalMs, deadline - Date.now()), signal);
 
-		let data: unknown;
+		let response: Response;
 		try {
-			data = await fetchJson(TOKEN_URL, {
+			response = await fetch(TOKEN_URL, {
 				method: "POST",
 				headers: jsonHeaders(),
 				body: formBody({
@@ -179,14 +180,30 @@ async function pollForToken(
 				}),
 				signal,
 			});
-		} catch (error) {
-			// Transient network errors during polling should not abort the flow.
-			if (signal?.aborted) throw error;
+		} catch {
+			// Network-level failures are transient; poll again until the deadline.
+			if (signal?.aborted) {
+				throw new Error("Login cancelled");
+			}
 			continue;
 		}
 
+		let data: unknown = null;
+		try {
+			data = await response.json();
+		} catch {
+			// Non-JSON body (e.g. an HTML error page from a proxy): transient.
+			if (!response.ok) {
+				continue;
+			}
+		}
+
 		if (data && typeof data === "object" && typeof (data as TokenPayload).access_token === "string") {
-			return data as TokenPayload;
+			const payload = data as TokenPayload;
+			if (!payload.access_token) {
+				throw new Error("xAI device flow returned an empty access token");
+			}
+			return payload;
 		}
 
 		if (data && typeof data === "object" && typeof (data as DeviceTokenErrorResponse).error === "string") {
@@ -195,8 +212,10 @@ async function pollForToken(
 				continue;
 			}
 			if (error === "slow_down") {
-				intervalMs =
-					typeof interval === "number" && interval > 0 ? interval * 1000 : Math.max(1000, intervalMs + 5000);
+				// RFC 8628: increase the interval by at least 5 seconds; a server
+				// hint can widen it further but must never shrink it.
+				const serverIntervalMs = typeof interval === "number" && interval > 0 ? interval * 1000 : 0;
+				intervalMs = Math.max(intervalMs + 5000, serverIntervalMs);
 				continue;
 			}
 			const descriptionSuffix = description ? `: ${description}` : "";
@@ -227,9 +246,27 @@ export async function loginXai(options: {
 	const device = await requestDeviceCode(options.signal);
 
 	const verificationUrl = device.verification_uri_complete || device.verification_uri;
+	// The verification URL is opened in the user's browser; only accept xAI's
+	// own origin (RFC 8628 recommends clients verify the verification URI).
+	try {
+		if (new URL(verificationUrl).origin !== ISSUER) {
+			throw new Error("unexpected origin");
+		}
+	} catch {
+		throw new Error(`xAI returned an unexpected verification URL: ${verificationUrl}`);
+	}
 	options.onAuth(verificationUrl, `Enter code: ${device.user_code}`);
 
-	const payload = await pollForToken(device.device_code, device.interval, device.expires_in, options.signal);
+	let payload: TokenPayload;
+	try {
+		payload = await pollForToken(device.device_code, device.interval, device.expires_in, options.signal);
+	} catch (error) {
+		// Cancellation must surface as a clean "Login cancelled", not a raw AbortError.
+		if (options.signal?.aborted) {
+			throw new Error("Login cancelled");
+		}
+		throw error;
+	}
 	if (!payload.refresh_token) {
 		throw new Error("xAI login response did not include a refresh token");
 	}
@@ -263,8 +300,9 @@ export async function refreshXaiToken(refreshToken: string): Promise<OAuthCreden
 			"xAI token refresh was denied (HTTP 403)." +
 				(detail ? ` Response: ${detail}.` : "") +
 				" This account is not entitled to xAI API access — xAI may restrict API/OAuth use to specific" +
-				" SuperGrok tiers even when the subscription is active. Logging in again will not fix this;" +
-				" set XAI_API_KEY to use the API-key provider instead, or review your subscription at https://x.ai/grok.",
+				" SuperGrok tiers even when the subscription is active. Logging in again will not fix this." +
+				" Run /logout to remove the xAI credentials, set XAI_API_KEY to use the API-key provider instead," +
+				" or review your subscription at https://x.ai/grok.",
 		);
 	}
 
@@ -279,6 +317,9 @@ export async function refreshXaiToken(refreshToken: string): Promise<OAuthCreden
 	const payload = (await response.json()) as TokenPayload;
 	if (typeof payload.access_token !== "string" || !payload.access_token) {
 		throw new Error("xAI token refresh response did not include an access token. Log in again with /login.");
+	}
+	if (typeof payload.expires_in !== "number" || !Number.isFinite(payload.expires_in) || payload.expires_in <= 0) {
+		throw new Error("xAI token refresh response did not include a valid expires_in. Log in again with /login.");
 	}
 
 	const credentials = tokenPayloadToCredentials(payload, Date.now());
