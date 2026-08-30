@@ -30,6 +30,10 @@ Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.js
 
 Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party harness usage draws from [extra usage](https://claude.ai/settings/usage) and is billed per token, not against Claude plan limits.
 
+### xAI (Grok SuperGrok / Premium+)
+
+xAI subscription auth uses the OAuth device code flow: `/login` -> xAI opens a verification URL, approve it in the browser, and the returned token is used against `https://api.x.ai/v1`. xAI requires a subscription tier entitled to API access; if refresh returns HTTP 403, the account is tier-gated — run `/logout` to remove the xAI credentials and use `XAI_API_KEY` instead (stored OAuth credentials take priority over the environment variable).
+
 ### GitHub Copilot
 
 - Press Enter for github.com, or enter your GitHub Enterprise Server domain
