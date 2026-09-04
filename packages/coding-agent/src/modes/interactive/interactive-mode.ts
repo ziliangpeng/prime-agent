@@ -7790,6 +7790,33 @@ export class InteractiveMode {
 		return [...modelsById.values()];
 	}
 
+	/**
+	 * Models listed by the /model picker. Providers without configured auth are
+	 * excluded: their catalogs mirror the same models (bedrock/openrouter/gateway
+	 * variants) and bury the usable entries behind dozens of duplicates. Scoped
+	 * models and the current model are always kept. While no provider is
+	 * configured yet the filter is bypassed so signed-out users still see the
+	 * public catalog with sign-in prompts. Autocomplete and /model <name>
+	 * resolution intentionally keep the full catalog (ENG-4575).
+	 */
+	private getModelPickerModels(
+		models: AgentConnectionModel[] = this.getCachedModelCandidates(),
+	): AgentConnectionModel[] {
+		const configured = this.connectionConfiguredProviders;
+		if (!configured || configured.size === 0) {
+			return models;
+		}
+		const keptIds = new Set<string>();
+		for (const scoped of this.getScopedModelState()) {
+			keptIds.add(`${scoped.model.provider}/${scoped.model.id}`);
+		}
+		const current = this.getCurrentModel();
+		if (current) {
+			keptIds.add(`${current.provider}/${current.id}`);
+		}
+		return models.filter((model) => configured.has(model.provider) || keptIds.has(`${model.provider}/${model.id}`));
+	}
+
 	private getModelSelectorRefreshPromise(
 		options: { force?: boolean } = {},
 	): Promise<AgentConnectionModel[]> | undefined {
@@ -8021,7 +8048,7 @@ export class InteractiveMode {
 	}
 
 	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
-		const modelCatalog = this.getCachedModelCandidates();
+		const modelCatalog = this.getModelPickerModels();
 		const authFlows = this.createAuthFlows();
 		const providerOptions = authFlows.getLoginProviderOptions();
 
@@ -8062,7 +8089,12 @@ export class InteractiveMode {
 				if (!refreshPromise) return;
 				void refreshPromise
 					.then((models) => {
-						if (!settled) menu.updateModels(this.getCurrentModel(), models, this.connectionConfiguredProviders);
+						if (!settled)
+							menu.updateModels(
+								this.getCurrentModel(),
+								this.getModelPickerModels(models),
+								this.connectionConfiguredProviders,
+							);
 					})
 					.catch((error) => {
 						if (!settled) this.showError(error instanceof Error ? error.message : String(error));
@@ -8092,7 +8124,7 @@ export class InteractiveMode {
 						await this.prepareForModelSelectionAfterLogin(authResult);
 						menu.updateModels(
 							this.getCurrentModel(),
-							this.getCachedModelCandidates(),
+							this.getModelPickerModels(),
 							this.connectionConfiguredProviders,
 						);
 						menu.setActiveTab("models");
@@ -8129,7 +8161,7 @@ export class InteractiveMode {
 							menu.refreshAuthentication();
 							menu.updateModels(
 								this.getCurrentModel(),
-								this.getCachedModelCandidates(),
+								this.getModelPickerModels(),
 								this.connectionConfiguredProviders,
 							);
 							if (!ready || settled) return;
@@ -8154,7 +8186,10 @@ export class InteractiveMode {
 	private async showModelsSelector(): Promise<void> {
 		let allModels: AgentConnectionModel[];
 		try {
-			allModels = await this.getConnectionModelCatalog();
+			// Curate from usable models only: providers without configured auth are
+			// excluded (they duplicate the same models across mirrors). Sign in from
+			// the Providers tab to make a provider's models appear here.
+			allModels = this.getModelPickerModels(await this.getConnectionModelCatalog());
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;

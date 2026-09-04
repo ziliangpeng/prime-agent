@@ -1,0 +1,1 @@
+- Fixed the /model picker drowning in duplicate mirror entries: models from providers without configured auth (bedrock/openrouter/gateway variants) are no longer listed. Scoped models and the current model are always kept, signed-out users still see the full catalog, and autocomplete keeps the full catalog (ENG-4575).
