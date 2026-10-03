@@ -88,6 +88,7 @@ async function startUdpCollector(): Promise<{
 		waitForPackets(count: number, timeoutMs = 3000) {
 			if (packets.length >= count) return Promise.resolve();
 			return new Promise((resolve, reject) => {
+				// test-policy: allow wall-clock-timer -- bounds failure only; resolution is event-driven on packet arrival
 				const timer = setTimeout(() => reject(new Error(`timeout: got ${packets.length}/${count}`)), timeoutMs);
 				waiters.push({
 					count,
@@ -173,8 +174,6 @@ describe("datadog-tokens extension", () => {
 
 		for (const handler of messageEndHandlers) {
 			await handler({ type: "message_end", message: assistantMessage() }, {} as never);
-			// allow the UDP send callback to flush
-			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 
 		await collector.waitForPackets(7);
@@ -214,7 +213,6 @@ describe("datadog-tokens extension", () => {
 			},
 			{} as never,
 		);
-		await new Promise((resolve) => setTimeout(resolve, 50));
 		await collector.waitForPackets(6);
 
 		const input = collector.packets.find((p) => p.metric === "prime.tokens.input");
@@ -246,7 +244,6 @@ describe("datadog-tokens extension", () => {
 			},
 			{} as never,
 		);
-		await new Promise((resolve) => setTimeout(resolve, 50));
 		await collector.waitForPackets(2);
 
 		// Zero token counters are skipped; api.calls and the (positive) duration
@@ -273,7 +270,6 @@ describe("datadog-tokens extension", () => {
 			},
 			{} as never,
 		);
-		await new Promise((resolve) => setTimeout(resolve, 50));
 		await collector.waitForPackets(2);
 
 		const metrics = collector.packets.map((p) => p.metric).sort();
@@ -300,6 +296,7 @@ describe("datadog-tokens extension", () => {
 			},
 			{} as never,
 		);
+		// test-policy: allow wall-clock-timer -- UDP has no negative ack; a bounded wait is the only way to assert nothing arrives
 		await new Promise((resolve) => setTimeout(resolve, 100));
 
 		expect(collector.packets).toEqual([]);
@@ -317,6 +314,7 @@ describe("datadog-tokens extension", () => {
 
 		await shutdown?.({ type: "session_shutdown" } as never, {} as never);
 		expect(() => messageEnd?.({ type: "message_end", message: assistantMessage() }, {} as never)).not.toThrow();
+		// test-policy: allow wall-clock-timer -- UDP has no negative ack; a bounded wait is the only way to assert nothing arrives
 		await new Promise((resolve) => setTimeout(resolve, 100));
 
 		expect(collector.packets).toEqual([]);
@@ -332,7 +330,6 @@ describe("datadog-tokens extension", () => {
 		const handler = handlers.get("message_end")?.[0];
 
 		await handler?.({ type: "message_end", message: assistantMessage() }, {} as never);
-		await new Promise((resolve) => setTimeout(resolve, 50));
 		await collector.waitForPackets(7);
 		expect(collector.packets.length).toBe(7);
 	});
