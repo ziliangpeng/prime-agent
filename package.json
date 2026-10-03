@@ -63,5 +63,10 @@
 			"rimraf": "6.1.2"
 		},
 		"shell-quote": "^1.10.0"
+	},
+	"allowScripts": {
+		"koffi": true,
+		"protobufjs@7.6.4": true,
+		"@google/genai": true
 	}
 }
