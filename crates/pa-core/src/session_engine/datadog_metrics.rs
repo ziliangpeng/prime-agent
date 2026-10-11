@@ -100,6 +100,18 @@ struct DogStatsDClient {
     socket: Mutex<Option<UdpSocket>>,
 }
 
+/// Local any-address matching the target's address family: an IPv6-bound
+/// socket cannot send to an IPv4 agent (and vice versa), so a hardcoded
+/// IPv4 bind made every IPv6-resolved agent target deterministically
+/// unreachable. Bind the family of the resolved destination.
+fn local_bind_addr(target: SocketAddr) -> SocketAddr {
+    let ip = match target {
+        SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    };
+    SocketAddr::new(ip, 0)
+}
+
 impl DogStatsDClient {
     const fn new() -> Self {
         DogStatsDClient {
@@ -116,7 +128,7 @@ impl DogStatsDClient {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_none() {
-            match UdpSocket::bind("0.0.0.0:0") {
+            match UdpSocket::bind(local_bind_addr(addr)) {
                 Ok(sock) => *guard = Some(sock),
                 Err(_) => return,
             }
@@ -185,18 +197,18 @@ pub fn build_packet(msg: &pa_agent::types::AssistantMessage, now_ms: i64) -> Str
         ];
         for (metric, value) in counts {
             if value > 0 {
-                lines.push(format!("{metric}:{value}|c{suffix}"));
+                lines.push(format!("{metric}:{value}|c|{suffix}"));
             }
         }
     }
 
     // Request counter: 1 per assistant message (i.e. per API call).
-    lines.push(format!("prime.api.calls:1|c{suffix}"));
+    lines.push(format!("prime.api.calls:1|c|{suffix}"));
 
     // Duration histogram (ms), from request start to message end.
     let duration = now_ms - msg.timestamp;
     if duration > 0 && duration <= MAX_DURATION_MS {
-        lines.push(format!("prime.api.duration_ms:{duration}|h{suffix}"));
+        lines.push(format!("prime.api.duration_ms:{duration}|h|{suffix}"));
     }
 
     lines.join("\n")
@@ -215,7 +227,12 @@ pub fn build_packet(msg: &pa_agent::types::AssistantMessage, now_ms: i64) -> Str
 /// is dropped on purpose: dropping it does not unsubscribe, and the
 /// listener's lifetime is the agent's.
 pub async fn install_datadog_metrics(agent: &Arc<pa_agent::agent::Agent>) {
-    let config = DatadogMetricsConfig::from_env();
+    install_with_config(agent, DatadogMetricsConfig::from_env()).await;
+}
+
+/// Config-injected install so tests can drive the enabled path against a
+/// local UDP receiver without mutating process env vars.
+async fn install_with_config(agent: &Arc<pa_agent::agent::Agent>, config: DatadogMetricsConfig) {
     if !config.enabled {
         return;
     }
