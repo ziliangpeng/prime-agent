@@ -1,0 +1,1 @@
+- Opt-in Datadog token metrics (PRIME_AGENT_DATADOG_METRICS=1) now send per-API-call token counters and a request-duration histogram to a local DogStatsD agent over UDP, tagged by model, provider, and API type. Mirrors the TypeScript-era extension's metric names, so existing dashboards keep working.

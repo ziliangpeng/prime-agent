@@ -631,6 +631,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             });
     }
     let telemetry_agent = std::sync::Arc::clone(&agent);
+    // Fork: Datadog token metrics (opt-in via PRIME_AGENT_DATADOG_METRICS=1).
+    // Independent subscription; never touches the telemetry pipeline, and
+    // installed outside the depth-0 gate so RLM child sessions report too.
+    super::datadog_metrics::install_datadog_metrics(&agent).await;
     let mut session = AgentSession::from_session_arc(
         agent.clone(),
         wiring.session.clone(),
