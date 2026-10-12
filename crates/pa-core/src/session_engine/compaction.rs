@@ -270,18 +270,25 @@ pub fn estimate_context_tokens(
 /// compat flag from the model's own compat block; the detected default is
 /// false, so `unwrap_or(false)` matches the provider-side `get_compat`
 /// resolution exactly.
+///
+/// Gated on the openai-completions API: the wire strip only exists in that
+/// provider, and `ModelCompat::kind()` classifies by key shape alone (any
+/// unrecognized compat map decodes as openai-completions), so a
+/// non-openai-completions model carrying the key must not strip its
+/// estimates while the wire still replays.
 #[must_use]
 pub fn strips_prior_turn_reasoning(model: &pa_types::ai::Model) -> bool {
-    model
-        .compat
-        .as_ref()
-        .and_then(|compat| compat.kind().ok())
-        .is_some_and(|kind| match kind {
-            pa_types::ai::CompatKind::OpenAiCompletions(compat) => {
-                compat.strip_prior_turn_reasoning.unwrap_or(false)
-            }
-            _ => false,
-        })
+    model.api == "openai-completions"
+        && model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.kind().ok())
+            .is_some_and(|kind| match kind {
+                pa_types::ai::CompatKind::OpenAiCompletions(compat) => {
+                    compat.strip_prior_turn_reasoning.unwrap_or(false)
+                }
+                _ => false,
+            })
 }
 
 /// A message's timestamp (millis since the epoch; every role carries one).
@@ -1068,5 +1075,50 @@ mod tests {
         // compaction summary is the last user-role message on the session side.
         let session_boundary = messages.iter().rposition(becomes_user_message);
         assert_eq!(session_boundary, Some(5));
+    }
+
+    #[test]
+    fn strips_prior_turn_reasoning_requires_the_openai_completions_api() {
+        use pa_types::ai::{CompatKind, ModelCompat, OpenAiCompletionsCompat};
+        let compat = || {
+            Some(ModelCompat::from_kind(CompatKind::OpenAiCompletions(
+                Box::new(OpenAiCompletionsCompat {
+                    strip_prior_turn_reasoning: Some(true),
+                    ..Default::default()
+                }),
+            )))
+        };
+        let model = |api: &str| pa_types::ai::Model {
+            id: "m".into(),
+            name: "m".into(),
+            api: api.into(),
+            provider: "p".into(),
+            base_url: "http://localhost".into(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![],
+            cost: pa_types::ai::ModelCost {
+                input: 0.0.into(),
+                output: 0.0.into(),
+                cache_read: 0.0.into(),
+                cache_write: 0.0.into(),
+            },
+            context_window: 128_000,
+            max_tokens: 8_192,
+            max_tokens_explicit: false,
+            featured: None,
+            headers: None,
+            compat: compat(),
+        };
+        assert!(strips_prior_turn_reasoning(&model("openai-completions")));
+        // A non-openai-completions route never strips the wire; the estimate
+        // must not strip either, even if the key sneaks into its compat block
+        // (`ModelCompat::kind()` classifies by key shape, not by api).
+        assert!(!strips_prior_turn_reasoning(&model("anthropic-messages")));
+        assert!(!strips_prior_turn_reasoning(&model("openai-responses")));
+        // Without the flag: never.
+        let mut bare = model("openai-completions");
+        bare.compat = None;
+        assert!(!strips_prior_turn_reasoning(&bare));
     }
 }
