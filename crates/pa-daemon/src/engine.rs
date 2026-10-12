@@ -190,6 +190,13 @@ pub trait SessionEngine: Send + Sync {
 
     /// Context window (tokens) of the engine's resolved model, when known.
     /// Drives the `contextUsage` estimate in `get_session_stats`.
+    /// The session's current registry-resolved model: daemon-side callers
+    /// resolve route behavior (e.g. the issue-#9 prior-turn reasoning strip
+    /// flag) without re-plumbing the model through every worker struct.
+    fn session_model(&self) -> Option<pa_types::ai::Model> {
+        None
+    }
+
     fn model_context_window(&self) -> Option<u64> {
         None
     }

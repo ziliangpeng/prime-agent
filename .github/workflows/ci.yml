@@ -73,10 +73,12 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # The fork integrates on ziliang-v0.10.0 (no main branch); both lines
+    # trigger the full-selection wave so merges stay the test authority.
+    branches: [main, ziliang-v0.10.0]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    branches: [main]
+    branches: [main, ziliang-v0.10.0]
   merge_group:
     types: [checks_requested]
 

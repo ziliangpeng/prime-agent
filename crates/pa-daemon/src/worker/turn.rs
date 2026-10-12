@@ -543,10 +543,14 @@ impl TurnRunner {
                             .as_ref()
                             .and_then(|store| store.branch().len().checked_sub(1))
                             .unwrap_or(0);
+                        let strip = engine.session_model().as_ref().is_some_and(
+                            pa_core::session_engine::compaction::strips_prior_turn_reasoning,
+                        );
                         if let Some(id) = core.store.as_ref().and_then(|store| {
-                            store.durable_first_kept_entry_id(keep_recent_tokens(
-                                &core.cwd, &agent_dir,
-                            ))
+                            store.durable_first_kept_entry_id(
+                                keep_recent_tokens(&core.cwd, &agent_dir),
+                                strip,
+                            )
                         }) {
                             entry["firstKeptEntryId"] = json!(id);
                             if let Some(result) =

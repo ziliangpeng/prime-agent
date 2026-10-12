@@ -46,7 +46,7 @@ fn prepare_compaction_split_arm_counts_the_turn_prefix_as_content() {
         .unwrap();
     session.append_message(user("small")).unwrap();
     let entries = session.get_all_entries().to_vec();
-    let preparation = prepare_compaction(&entries, 10).expect("split compaction prepares");
+    let preparation = prepare_compaction(&entries, 10, false).expect("split compaction prepares");
     assert!(preparation.cut.is_split_turn);
     assert_eq!(preparation.cut.turn_start_index, Some(1));
     assert_eq!(preparation.previous_summary, None);
@@ -54,7 +54,7 @@ fn prepare_compaction_split_arm_counts_the_turn_prefix_as_content() {
     small.append_message(user("one small turn")).unwrap();
     let entries = small.get_all_entries().to_vec();
     assert_eq!(
-        prepare_compaction(&entries, 10_000),
+        prepare_compaction(&entries, 10_000, false),
         Err(CompactSkip::TooShort)
     );
 }
@@ -139,7 +139,8 @@ fn prepare_compaction_anchors_on_the_newest_kept_tail_assistant_text() {
         raw_user_entry("m1", &"1".repeat(400)),
         raw_assistant_text_entry("a2", &"newest tail text ".repeat(25)),
     ];
-    let preparation = prepare_compaction(&entries, 250).expect("anchored compaction prepares");
+    let preparation =
+        prepare_compaction(&entries, 250, false).expect("anchored compaction prepares");
     assert_eq!(preparation.cut.first_kept_entry_index, 1);
     // The anchor text trims like the TS scan (`.join("\n").trim()`).
     assert_eq!(
@@ -185,7 +186,8 @@ fn prepare_compaction_anchors_on_the_newest_kept_tail_assistant_text() {
         raw_user_entry("m1", &"1".repeat(400)),
         thinking_only,
     ];
-    let preparation = prepare_compaction(&entries, 250).expect("anchored compaction prepares");
+    let preparation =
+        prepare_compaction(&entries, 250, false).expect("anchored compaction prepares");
     assert_eq!(
         preparation.recent_state_anchor.as_deref(),
         Some("older tail text ".repeat(25).trim())
@@ -198,7 +200,8 @@ fn prepare_compaction_anchors_on_the_newest_kept_tail_assistant_text() {
         raw_user_entry("m1", &"1".repeat(400)),
         raw_assistant_text_entry("a2", &"z".repeat(3_000)),
     ];
-    let preparation = prepare_compaction(&entries, 250).expect("anchored compaction prepares");
+    let preparation =
+        prepare_compaction(&entries, 250, false).expect("anchored compaction prepares");
     let anchor = preparation
         .recent_state_anchor
         .expect("tail-truncated anchor");
@@ -211,7 +214,8 @@ fn prepare_compaction_anchors_on_the_newest_kept_tail_assistant_text() {
         raw_user_entry("m1", &"1".repeat(400)),
         raw_user_entry("m2", "small"),
     ];
-    let preparation = prepare_compaction(&entries, 250).expect("prior-summary compaction prepares");
+    let preparation =
+        prepare_compaction(&entries, 250, false).expect("prior-summary compaction prepares");
     assert_eq!(preparation.recent_state_anchor, None);
     assert_eq!(
         preparation.previous_summary.as_deref(),
@@ -233,7 +237,7 @@ fn prepare_compaction_strips_file_blocks_from_the_previous_summary() {
         raw_user_entry("m1", "turn one"),
         raw_user_entry("m2", "turn two"),
     ];
-    let preparation = prepare_compaction(&entries, 2).expect("update compaction prepares");
+    let preparation = prepare_compaction(&entries, 2, false).expect("update compaction prepares");
     assert_eq!(
         preparation.previous_summary,
         Some("the prior summary".to_string())
@@ -248,7 +252,7 @@ fn prepare_compaction_strips_file_blocks_from_the_previous_summary() {
         raw_user_entry("m1", "turn one"),
         raw_user_entry("m2", "turn two"),
     ];
-    let preparation = prepare_compaction(&entries, 2).expect("update compaction prepares");
+    let preparation = prepare_compaction(&entries, 2, false).expect("update compaction prepares");
     assert_eq!(preparation.previous_summary, None);
 }
 
@@ -264,7 +268,7 @@ fn prepare_compaction_update_mode_anchors_on_the_prior_compaction() {
         raw_user_entry("m3", "turn three"),
         raw_user_entry("m4", "turn four"),
     ];
-    let preparation = prepare_compaction(&entries, 2).expect("update compaction prepares");
+    let preparation = prepare_compaction(&entries, 2, false).expect("update compaction prepares");
     assert_eq!(preparation.boundary_start, 1);
     assert_eq!(
         preparation.previous_summary,
@@ -278,7 +282,7 @@ fn prepare_compaction_update_mode_anchors_on_the_prior_compaction() {
         raw_user_entry("m0", "turn zero"),
         raw_user_entry("m1", "turn one"),
     ];
-    let preparation = prepare_compaction(&fresh, 2).expect("fresh compaction prepares");
+    let preparation = prepare_compaction(&fresh, 2, false).expect("fresh compaction prepares");
     assert_eq!(preparation.previous_summary, None);
     assert_eq!(preparation.boundary_start, 0);
 }
@@ -291,17 +295,17 @@ fn prepare_compaction_boundary_fallback_and_prior_summary_guard() {
         raw_compaction_entry("c1", "gone-entry", "the prior summary"),
         raw_user_entry("m1", "turn one"),
     ];
-    let preparation = prepare_compaction(&entries, 2).expect("fallback boundary prepares");
+    let preparation = prepare_compaction(&entries, 2, false).expect("fallback boundary prepares");
     assert_eq!(preparation.boundary_start, 1);
     assert_eq!(
         preparation.previous_summary,
         Some("the prior summary".to_string())
     );
-    let preparation = prepare_compaction(&entries, 10_000).expect("prior summary runs");
+    let preparation = prepare_compaction(&entries, 10_000, false).expect("prior summary runs");
     assert_eq!(preparation.cut.first_kept_entry_index, 1);
     let fresh = vec![raw_user_entry("m1", "turn one")];
     assert_eq!(
-        prepare_compaction(&fresh, 10_000),
+        prepare_compaction(&fresh, 10_000, false),
         Err(CompactSkip::TooShort)
     );
 }

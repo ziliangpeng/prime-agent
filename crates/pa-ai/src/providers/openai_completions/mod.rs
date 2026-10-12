@@ -104,6 +104,9 @@ pub struct ResolvedCompat {
     pub requires_assistant_after_tool_result: bool,
     pub requires_thinking_as_text: bool,
     pub requires_reasoning_content_on_assistant_messages: bool,
+    /// Strip prior-turn reasoning replay on the wire (issue #9). Default
+    /// false; opt in per model via the models.json compat block.
+    pub strip_prior_turn_reasoning: bool,
     pub thinking_format: crate::types::ThinkingFormat,
     pub supports_strict_mode: bool,
     pub cache_control_format: Option<crate::types::CacheControlFormat>,
@@ -174,6 +177,7 @@ pub fn detect_compat(model: &Model) -> ResolvedCompat {
         requires_assistant_after_tool_result: false,
         requires_thinking_as_text: false,
         requires_reasoning_content_on_assistant_messages: is_deep_seek,
+        strip_prior_turn_reasoning: false,
         thinking_format: if is_deep_seek {
             crate::types::ThinkingFormat::Deepseek
         } else if is_zai {
@@ -227,6 +231,9 @@ pub fn get_compat(model: &Model) -> ResolvedCompat {
         requires_reasoning_content_on_assistant_messages: compat
             .requires_reasoning_content_on_assistant_messages
             .unwrap_or(detected.requires_reasoning_content_on_assistant_messages),
+        strip_prior_turn_reasoning: compat
+            .strip_prior_turn_reasoning
+            .unwrap_or(detected.strip_prior_turn_reasoning),
         thinking_format: compat.thinking_format.unwrap_or(detected.thinking_format),
         open_router_routing: compat
             .open_router_routing

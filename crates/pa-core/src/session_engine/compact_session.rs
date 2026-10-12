@@ -3,7 +3,9 @@
 
 use pa_types::session::{AgentMessage, FileEntry};
 
-use super::compaction::{estimate_context_tokens, find_cut_point, CutPointResult};
+use super::compaction::{
+    estimate_context_tokens, find_cut_point, strips_prior_turn_reasoning, CutPointResult,
+};
 use super::compaction_exec;
 use super::compaction_exec::{
     build_summarization_request, build_turn_prefix_request, compaction_entry_for,
@@ -95,9 +97,13 @@ fn message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
 /// The pre-compaction context estimate recorded as `tokensBefore`: the last
 /// non-error/aborted assistant usage plus a chars/4 estimate of the messages
 /// that trail it — error and aborted usage is not a real measurement.
-fn context_tokens(entries: &[FileEntry], leaf_id: Option<&str>) -> u64 {
+fn context_tokens(
+    entries: &[FileEntry],
+    leaf_id: Option<&str>,
+    strip_prior_turn_reasoning: bool,
+) -> u64 {
     let context = crate::session::build_session_context(entries, leaf_id);
-    estimate_context_tokens(&context.messages).tokens
+    estimate_context_tokens(&context.messages, strip_prior_turn_reasoning).tokens
 }
 
 /// One completed compaction run: the result plus the entry to persist.
@@ -150,7 +156,11 @@ pub(crate) fn prepare_attempt(
 ) -> Result<CompactionAttempt, CompactSkip> {
     let entries = session.retained_entries().to_vec();
     let prefix_leaf = session.get_leaf_id().map(str::to_string);
-    let preparation = prepare_compaction(&entries, options.settings.keep_recent_tokens)?;
+    let preparation = prepare_compaction(
+        &entries,
+        options.settings.keep_recent_tokens,
+        strips_prior_turn_reasoning(&options.model),
+    )?;
     // TS `beginCompaction` after the preparation resolved: a skipped
     // compaction makes no events (the begin comes after the skip throw).
     let semantic_compaction = options
@@ -191,7 +201,11 @@ pub(crate) fn prepare_attempt(
             "turnPrefixMessages": turn_prefix_messages.len(),
         }),
     );
-    let tokens_before = context_tokens(&entries, session.get_leaf_id());
+    let tokens_before = context_tokens(
+        &entries,
+        session.get_leaf_id(),
+        strips_prior_turn_reasoning(&options.model),
+    );
     super::compaction_trace::trace(
         "compact.tokens_before_computed",
         &serde_json::json!({ "tokensBefore": tokens_before }),

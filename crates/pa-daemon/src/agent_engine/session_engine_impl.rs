@@ -240,6 +240,10 @@ impl SessionEngine for AgentSessionEngine {
         Some(std::sync::Arc::clone(&self.mcp))
     }
 
+    fn session_model(&self) -> Option<pa_types::ai::Model> {
+        self.resolve_registry_model().ok()
+    }
+
     fn model_context_window(&self) -> Option<u64> {
         self.resolve_model().ok().map(|model| model.context_window)
     }
