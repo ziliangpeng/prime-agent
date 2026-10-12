@@ -6,23 +6,70 @@ use crate::models::{calculate_cost, CostOverrides};
 use crate::providers::openai_completions::{decode_reasoning_details, ResolvedCompat};
 use crate::providers::transform_messages::transform_messages_with_normalizer;
 use crate::types::{
-    AssistantContent, Context, MessageExt, Model, ModelInput, StopReason, TextContent,
+    AssistantContent, Context, Message, MessageExt, Model, ModelInput, StopReason, TextContent,
     ThinkingContent, Tool, ToolCall, Usage, UsageCost, UserMessageContent, UserOrToolContent,
 };
 use crate::utils_inner::sanitize_unicode::sanitize_surrogates;
+
+/// Strip prior-turn reasoning replay from the request messages (issue #9).
+///
+/// The boundary is the last user message: assistant messages before it belong
+/// to completed turns, so their thinking replay (the `reasoning` /
+/// `reasoning_content` field, `reasoning_details`, and tool-call thought
+/// signatures) is removed. Assistant messages after the boundary — the current
+/// tool-call chain — keep their reasoning so mid-turn reasoning keeps
+/// round-tripping. A request with no user message keeps everything (the whole
+/// context is then the current chain).
+///
+/// Must run BEFORE [`transform_messages_with_normalizer`]: the transform
+/// converts cross-model unsigned thinking into visible text, where a strip
+/// could no longer find it.
+fn strip_prior_turn_reasoning(messages: &[Message]) -> Vec<Message> {
+    let boundary = messages
+        .iter()
+        .rposition(|message| matches!(message, Message::User(_)));
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| match (message, boundary) {
+            (Message::Assistant(assistant), Some(boundary)) if index < boundary => {
+                let mut stripped = assistant.clone();
+                stripped
+                    .content
+                    .retain(|block| !matches!(block, AssistantContent::Thinking(_)));
+                for block in &mut stripped.content {
+                    if let AssistantContent::ToolCall(call) = block {
+                        call.thought_signature = None;
+                    }
+                }
+                Message::Assistant(stripped)
+            }
+            _ => message.clone(),
+        })
+        .collect()
+}
 
 /// Convert a conversation into Chat Completions `messages` params, including tool-result bridging
 /// and image replay.
 // Long by design: mirrors the provider's stream shape.
 #[allow(clippy::too_many_lines)]
 pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompat) -> Vec<Value> {
-    use crate::types::Message;
     let mut params: Vec<Value> = Vec::new();
 
-    let transformed =
-        transform_messages_with_normalizer(&context.messages, model, &|id, model, _| {
-            Some(normalize_tool_call_id(id, model))
-        });
+    // Prior-turn reasoning strip (issue #9) runs BEFORE the transform: the
+    // transform folds cross-model unsigned thinking into visible text, where
+    // a post-transform strip could no longer remove it.
+    let stripped_messages;
+    let messages: &[Message] = if compat.strip_prior_turn_reasoning {
+        stripped_messages = strip_prior_turn_reasoning(&context.messages);
+        &stripped_messages
+    } else {
+        &context.messages
+    };
+
+    let transformed = transform_messages_with_normalizer(messages, model, &|id, model, _| {
+        Some(normalize_tool_call_id(id, model))
+    });
 
     if let Some(system_prompt) = &context.system_prompt {
         let use_developer_role = model.reasoning && compat.supports_developer_role;
@@ -580,6 +627,227 @@ mod tests {
             }
         }
         raw
+    }
+
+    // --- issue #9: prior-turn reasoning strip ---
+
+    fn strip_model() -> Model {
+        let mut model = model("midagent", 0.5, 0.5);
+        model.reasoning = true;
+        model
+    }
+
+    fn compat_with_strip(strip: bool) -> ResolvedCompat {
+        let mut compat = crate::providers::openai_completions::detect_compat(&strip_model());
+        compat.strip_prior_turn_reasoning = strip;
+        compat
+    }
+
+    fn ctx_user(text: &str) -> Message {
+        Message::User(crate::types::UserMessage {
+            content: UserMessageContent::Text(text.to_string()),
+            timestamp: 0,
+            rest: Map::default(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assistant_msg(
+        thinking: Option<(&str, Option<&str>)>,
+        text: Option<&str>,
+        tool_call: Option<(&str, Option<&str>)>,
+        model_id: &str,
+    ) -> Message {
+        let mut content: Vec<AssistantContent> = Vec::new();
+        if let Some((thinking, signature)) = thinking {
+            content.push(AssistantContent::Thinking(ThinkingContent {
+                thinking: thinking.to_string(),
+                thinking_signature: signature.map(str::to_string),
+                redacted: None,
+                rest: Map::default(),
+            }));
+        }
+        if let Some(text) = text {
+            content.push(AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+                rest: Map::default(),
+            }));
+        }
+        if let Some((id, thought_signature)) = tool_call {
+            content.push(AssistantContent::ToolCall(ToolCall {
+                id: id.to_string(),
+                name: "echo".to_string(),
+                arguments: Map::default(),
+                thought_signature: thought_signature.map(str::to_string),
+                rest: Map::default(),
+            }));
+        }
+        Message::Assistant(crate::types::AssistantMessage {
+            content,
+            api: "openai-completions".into(),
+            provider: "midagent".into(),
+            model: model_id.to_string(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            stop_reason_raw: None,
+            error_message: None,
+            timestamp: 0,
+            rest: Map::default(),
+        })
+    }
+
+    fn ctx_tool_result(id: &str) -> Message {
+        Message::ToolResult(crate::types::ToolResultMessage {
+            tool_call_id: id.to_string(),
+            tool_name: "echo".to_string(),
+            content: vec![UserOrToolContent::Text(TextContent {
+                text: "result".to_string(),
+                text_signature: None,
+                rest: Map::default(),
+            })],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+            rest: Map::default(),
+        })
+    }
+
+    fn two_turn_context() -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![
+                ctx_user("turn one"),
+                assistant_msg(
+                    Some(("old reasoning", Some("reasoning"))),
+                    Some("old answer"),
+                    Some(("call-1", Some(r#"[{"type":"reasoning"}]"#))),
+                    "m",
+                ),
+                ctx_tool_result("call-1"),
+                ctx_user("turn two"),
+                assistant_msg(
+                    Some(("current reasoning", Some("reasoning"))),
+                    None,
+                    Some(("call-2", Some(r#"[{"type":"reasoning"}]"#))),
+                    "m",
+                ),
+                ctx_tool_result("call-2"),
+            ],
+            tools: None,
+        }
+    }
+
+    fn message_json(params: &[Value], index: usize) -> &Value {
+        params
+            .get(index)
+            .unwrap_or_else(|| panic!("no message at index {index}"))
+    }
+
+    #[test]
+    fn strip_removes_old_turn_reasoning_and_keeps_current_chain() {
+        let model = strip_model();
+        let context = two_turn_context();
+
+        // Flag on: the first (old-turn) assistant loses its reasoning replay;
+        // the second (current tool-call chain) keeps it.
+        let params = convert_messages(&model, &context, &compat_with_strip(true));
+        let old = message_json(&params, 1);
+        assert_eq!(old["role"], "assistant");
+        assert!(old.get("reasoning").is_none(), "old reasoning stripped");
+        assert!(
+            old.get("reasoning_details").is_none(),
+            "old tool-call reasoning_details stripped"
+        );
+        assert_eq!(old["content"], "old answer");
+        let current = message_json(&params, 4);
+        assert_eq!(current["role"], "assistant");
+        assert_eq!(current["reasoning"], "current reasoning");
+        assert!(current.get("reasoning_details").is_some());
+
+        // Flag off (default): full replay, unchanged behavior.
+        let params = convert_messages(&model, &context, &compat_with_strip(false));
+        let old = message_json(&params, 1);
+        assert_eq!(old["reasoning"], "old reasoning");
+        assert!(old.get("reasoning_details").is_some());
+    }
+
+    #[test]
+    fn strip_removes_cross_model_thinking_before_the_transform_folds_it_into_text() {
+        // B1 regression: cross-model unsigned thinking becomes visible text in
+        // the transform, so the strip must run before it.
+        let model = strip_model();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                ctx_user("turn one"),
+                assistant_msg(
+                    Some(("cross model reasoning", None)),
+                    Some("old answer"),
+                    None,
+                    "other-model",
+                ),
+                ctx_user("turn two"),
+            ],
+            tools: None,
+        };
+
+        let params = convert_messages(&model, &context, &compat_with_strip(true));
+        let wire = serde_json::to_string(&params).expect("serializable");
+        assert!(
+            !wire.contains("cross model reasoning"),
+            "cross-model thinking must not reach the wire in any form"
+        );
+
+        let params = convert_messages(&model, &context, &compat_with_strip(false));
+        let wire = serde_json::to_string(&params).expect("serializable");
+        assert!(
+            wire.contains("cross model reasoning"),
+            "flag off keeps the cross-model thinking (as text)"
+        );
+    }
+
+    #[test]
+    fn strip_drops_a_thinking_only_assistant_message() {
+        let model = strip_model();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                ctx_user("turn one"),
+                assistant_msg(Some(("only thinking", None)), None, None, "other-model"),
+                ctx_user("turn two"),
+            ],
+            tools: None,
+        };
+
+        let params = convert_messages(&model, &context, &compat_with_strip(true));
+        // The stripped assistant is empty and falls into the skip guard.
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0]["role"], "user");
+        assert_eq!(params[1]["role"], "user");
+    }
+
+    #[test]
+    fn get_compat_resolves_strip_prior_turn_reasoning_from_models_json() {
+        use crate::types::{CompatKind, ModelCompat, OpenAiCompletionsCompat};
+        let mut model = strip_model();
+        model.compat = Some(ModelCompat::from_kind(CompatKind::OpenAiCompletions(
+            Box::new(OpenAiCompletionsCompat {
+                strip_prior_turn_reasoning: Some(true),
+                ..Default::default()
+            }),
+        )));
+        assert!(
+            crate::providers::openai_completions::get_compat(&model).strip_prior_turn_reasoning
+        );
+        // Default off without the models.json override.
+        assert!(
+            !crate::providers::openai_completions::get_compat(&strip_model())
+                .strip_prior_turn_reasoning
+        );
     }
 
     #[test]
