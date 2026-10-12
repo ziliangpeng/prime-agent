@@ -19,6 +19,33 @@ pub const HARNESS_DIGEST_SUFFIX: &str = "\n</harness_state>";
 pub use pa_types::slash_commands::{
     SESSION_SLASH_COMMAND_CUSTOM_TYPE, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 };
+
+/// Whether this agent message becomes a user-role message on the LLM wire
+/// (after [`convert_to_llm`]).
+///
+/// The prior-turn reasoning strip boundary (issue #9) is "the last user
+/// message": on the wire side it is the last `Message::User` after
+/// conversion; on the session side it is the last message for which this
+/// predicate holds. The two definitions must stay equivalent — see the
+/// equivalence test in `compaction.rs`.
+#[must_use]
+pub fn becomes_user_message(message: &AgentMessage) -> bool {
+    match message {
+        AgentMessage::User(_)
+        | AgentMessage::BranchSummary(_)
+        | AgentMessage::CompactionSummary(_) => true,
+        AgentMessage::BashExecution(bash) => !bash.exclude_from_context.unwrap_or(false),
+        AgentMessage::Custom(custom) => !matches!(
+            custom.custom_type.as_str(),
+            SESSION_SLASH_COMMAND_CUSTOM_TYPE
+                | SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
+                | COMPACTION_OUTCOME_CUSTOM_TYPE
+                | REFINEMENT_OUTCOME_CUSTOM_TYPE
+                | PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE
+        ),
+        AgentMessage::Assistant(_) | AgentMessage::ToolResult(_) => false,
+    }
+}
 pub const COMPACTION_OUTCOME_CUSTOM_TYPE: &str = "compaction_outcome";
 pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";
 pub const REFINEMENT_NOTICE_CUSTOM_TYPE: &str = "refinement_notice";

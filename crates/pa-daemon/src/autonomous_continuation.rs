@@ -203,6 +203,7 @@ impl AgentSessionEngine {
                 ),
             ),
             &mirror.compaction,
+            pa_core::session_engine::compaction::strips_prior_turn_reasoning(&model),
         )
     }
 

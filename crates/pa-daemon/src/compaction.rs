@@ -238,8 +238,13 @@ impl CompactionManager {
                 .unwrap_or_default()
                 .keep_recent_tokens
                 .unwrap_or(pa_core::session_engine::compaction::DEFAULT_KEEP_RECENT_TOKENS);
+            let strip = self
+                .engine
+                .session_model()
+                .as_ref()
+                .is_some_and(pa_core::session_engine::compaction::strips_prior_turn_reasoning);
             store
-                .durable_first_kept_entry_id(keep_recent)
+                .durable_first_kept_entry_id(keep_recent, strip)
                 .unwrap_or(first_kept_entry_id)
         };
         fields["firstKeptEntryId"] = json!(first_kept_entry_id);

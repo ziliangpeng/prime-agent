@@ -101,7 +101,8 @@ async fn rebuilt_live_context_prevents_repeat_auto_compaction_until_new_usage() 
         &session.active_context().messages,
         128_000,
         0,
-        &settings
+        &settings,
+        false
     ));
     let outcome = execute_compaction(
         &mut session,
@@ -162,12 +163,12 @@ async fn rebuilt_live_context_prevents_repeat_auto_compaction_until_new_usage() 
         }));
     }
     assert!(!super::super::compaction::threshold_compaction_due(
-        &live, 128_000, 0, &settings
+        &live, 128_000, 0, &settings, false
     ));
     assistant.timestamp = summary_timestamp + 2;
     live.push(AgentMessage::Assistant(assistant));
     assert!(super::super::compaction::threshold_compaction_due(
-        &live, 128_000, 0, &settings
+        &live, 128_000, 0, &settings, false
     ));
     registration.unregister();
 }
@@ -269,7 +270,7 @@ async fn split_turn_compaction_streams_in_final_order_and_converges() {
     session.append_message(reply("reply three")).unwrap();
     // The tiny keep-recent budget lands the cut on the big turn's
     // assistant reply — a mid-turn (split) cut.
-    let (cut, _) = compute_cut(&session, 10);
+    let (cut, _) = compute_cut(&session, 10, false);
     assert!(cut.is_split_turn);
 
     // Two scripted summaries (the factories answer in issue order,
@@ -545,7 +546,7 @@ async fn durable_compaction_row_carries_the_ts_record() {
     let model = registration.get_model();
     let tmp = tempfile::tempdir().unwrap();
     let mut session = session_with_turns(tmp.path(), 3);
-    let before = context_tokens(session.get_all_entries(), session.get_leaf_id());
+    let before = context_tokens(session.get_all_entries(), session.get_leaf_id(), false);
     let outcome = execute_compaction(
         &mut session,
         CompactOptions {

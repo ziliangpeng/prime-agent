@@ -170,7 +170,9 @@ pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> Branc
             continue;
         };
         extract_file_ops_from_message(&message, &mut file_ops);
-        let tokens = estimate_tokens(&message);
+        // The branch summarizer reads thinking as summarizer input, so it
+        // always counts (chars/4) regardless of any wire-side strip.
+        let tokens = estimate_tokens(&message, true);
         if token_budget > 0 && total_tokens + tokens > token_budget {
             // Compaction/branch summaries squeeze in under 90% budget.
             let boundary = matches!(

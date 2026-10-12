@@ -374,7 +374,11 @@ impl SessionFile {
     /// The durable entry id the compaction cut keeps: the engine's
     /// `firstKeptEntryId` references in-memory ids that never exist in the file —
     /// the re-cut pins the boundary the file read recognizes.
-    pub fn durable_first_kept_entry_id(&self, keep_recent_tokens: u64) -> Option<String> {
+    pub fn durable_first_kept_entry_id(
+        &self,
+        keep_recent_tokens: u64,
+        strip_prior_turn_reasoning: bool,
+    ) -> Option<String> {
         let branch = self.branch();
         let entries: Vec<pa_types::session::FileEntry> = branch
             .iter()
@@ -391,6 +395,7 @@ impl SessionFile {
             start,
             entries.len(),
             keep_recent_tokens,
+            strip_prior_turn_reasoning,
         );
         entries
             .get(cut.first_kept_entry_index)

@@ -71,8 +71,12 @@ pub fn get_last_assistant_usage(entries: &[FileEntry]) -> Option<pa_types::ai::U
 }
 
 /// Chars/4 heuristic token estimate (conservative; overestimates).
+///
+/// `count_thinking` false counts a Thinking block as zero tokens — used on
+/// routes that strip prior-turn reasoning from the wire (issue #9), where the
+/// thinking of assistant messages before the last user message is never sent.
 #[must_use]
-pub fn estimate_tokens(message: &AgentMessage) -> u64 {
+pub fn estimate_tokens(message: &AgentMessage, count_thinking: bool) -> u64 {
     let chars = |text: &str| text.chars().count() as u64;
     match message {
         AgentMessage::User(user) => match &user.content {
@@ -93,7 +97,9 @@ pub fn estimate_tokens(message: &AgentMessage) -> u64 {
                 match block {
                     pa_types::ai::AssistantContentBlock::Text(text) => total += chars(&text.text),
                     pa_types::ai::AssistantContentBlock::Thinking(thinking) => {
-                        total += chars(&thinking.thinking);
+                        if count_thinking {
+                            total += chars(&thinking.thinking);
+                        }
                     }
                     pa_types::ai::AssistantContentBlock::ToolCall(call) => {
                         total += chars(&call.name)
@@ -213,24 +219,69 @@ pub struct ContextTokensEstimate {
 ///
 /// The `expect` cannot fire: the index comes from an `rposition` over
 /// messages with usage present.
-pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextTokensEstimate {
+#[must_use]
+pub fn estimate_context_tokens(
+    messages: &[AgentMessage],
+    strip_prior_turn_reasoning: bool,
+) -> ContextTokensEstimate {
+    // The strip boundary (issue #9): the last message that becomes a
+    // user-role message on the wire. Thinking before it is never sent, so it
+    // estimates as zero on stripping routes. A context with no user message
+    // is one long current chain: nothing is stripped.
+    let boundary = strip_prior_turn_reasoning
+        .then(|| {
+            messages
+                .iter()
+                .rposition(super::messages::becomes_user_message)
+        })
+        .flatten();
+    let estimate = |index: usize, message: &AgentMessage| {
+        estimate_tokens(message, boundary.is_none_or(|boundary| index >= boundary))
+    };
     match messages
         .iter()
         .rposition(|message| assistant_usage(message).is_some())
     {
         Some(index) => {
             let usage = assistant_usage(&messages[index]).expect("index from rposition");
-            let trailing: u64 = messages[index + 1..].iter().map(estimate_tokens).sum();
+            let trailing: u64 = messages[index + 1..]
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| estimate(index + 1 + offset, message))
+                .sum();
             ContextTokensEstimate {
                 tokens: calculate_context_tokens(&usage) + trailing,
                 last_usage_index: Some(index),
             }
         }
         None => ContextTokensEstimate {
-            tokens: messages.iter().map(estimate_tokens).sum(),
+            tokens: messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| estimate(index, message))
+                .sum(),
             last_usage_index: None,
         },
     }
+}
+
+/// Whether the model's openai-completions route strips prior-turn reasoning
+/// replay on the wire (issue #9). Resolves the `stripPriorTurnReasoning`
+/// compat flag from the model's own compat block; the detected default is
+/// false, so `unwrap_or(false)` matches the provider-side `get_compat`
+/// resolution exactly.
+#[must_use]
+pub fn strips_prior_turn_reasoning(model: &pa_types::ai::Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.kind().ok())
+        .is_some_and(|kind| match kind {
+            pa_types::ai::CompatKind::OpenAiCompletions(compat) => {
+                compat.strip_prior_turn_reasoning.unwrap_or(false)
+            }
+            _ => false,
+        })
 }
 
 /// A message's timestamp (millis since the epoch; every role carries one).
@@ -255,6 +306,7 @@ pub fn threshold_compaction_due(
     context_window: u64,
     max_output_tokens: u64,
     settings: &CompactionSettings,
+    strip_prior_turn_reasoning: bool,
 ) -> bool {
     if !settings.enabled || context_window == 0 {
         return false;
@@ -263,7 +315,7 @@ pub fn threshold_compaction_due(
         AgentMessage::CompactionSummary(summary) => Some(summary.timestamp),
         _ => None,
     });
-    let estimate = estimate_context_tokens(messages);
+    let estimate = estimate_context_tokens(messages, strip_prior_turn_reasoning);
     let context_tokens = if let Some(index) = estimate.last_usage_index {
         // The usage anchor must postdate the latest compaction.
         if compaction_timestamp
@@ -292,6 +344,38 @@ pub fn threshold_compaction_due(
         calculate_context_tokens(&assistant.usage)
     };
     should_compact(context_tokens, context_window, max_output_tokens, settings)
+}
+
+/// Whether a session entry becomes a user-role message on the LLM wire.
+///
+/// The [`FileEntry`] mirror of [`super::messages::becomes_user_message`] for
+/// the strip boundary in [`find_cut_point`]: message entries delegate to the
+/// [`AgentMessage`] predicate; [`FileEntry::CustomMessage`] entries apply the
+/// same filtered custom-type rule; branch summaries become user. Approximation: an older
+/// harness-digest `custom_message` that the context assembly drops still
+/// counts as a boundary here — the divergence is bounded by one turn and
+/// rare (digests sit at session/compaction starts, not at the live tail).
+fn entry_becomes_user_message(entry: &FileEntry) -> bool {
+    match entry {
+        FileEntry::Message { message, .. } => super::messages::becomes_user_message(message),
+        FileEntry::BranchSummary { .. } => true,
+        FileEntry::CustomMessage { payload, .. } => {
+            use super::messages::{
+                COMPACTION_OUTCOME_CUSTOM_TYPE, PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE,
+                REFINEMENT_OUTCOME_CUSTOM_TYPE, SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+                SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+            };
+            !matches!(
+                payload.custom_type.as_str(),
+                SESSION_SLASH_COMMAND_CUSTOM_TYPE
+                    | SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
+                    | COMPACTION_OUTCOME_CUSTOM_TYPE
+                    | REFINEMENT_OUTCOME_CUSTOM_TYPE
+                    | PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Valid cut point indices: user/assistant/custom/branch/compaction-summary
@@ -370,6 +454,7 @@ pub fn find_cut_point(
     start_index: usize,
     end_index: usize,
     keep_recent_tokens: u64,
+    strip_prior_turn_reasoning: bool,
 ) -> CutPointResult {
     let cut_points = find_valid_cut_points(entries, start_index, end_index);
     if cut_points.is_empty() {
@@ -379,6 +464,12 @@ pub fn find_cut_point(
             is_split_turn: false,
         };
     }
+    // Strip-boundary tracking (issue #9): walking backward from the newest
+    // entry, the first entry that becomes a user-role message on the wire is
+    // the boundary; thinking in entries below it is never sent and estimates
+    // as zero on stripping routes. Everything above the boundary (the current
+    // tool-call chain) still round-trips its reasoning and counts in full.
+    let mut past_boundary = false;
     let mut accumulated = 0u64;
     let mut cut_index = cut_points[0];
     for (i, entry) in entries
@@ -390,10 +481,14 @@ pub fn find_cut_point(
         .into_iter()
         .rev()
     {
+        if strip_prior_turn_reasoning && entry_becomes_user_message(entry) {
+            past_boundary = true;
+        }
         let FileEntry::Message { message, .. } = entry else {
             continue;
         };
-        accumulated = accumulated.saturating_add(estimate_tokens(message));
+        let count_thinking = !(strip_prior_turn_reasoning && past_boundary);
+        accumulated = accumulated.saturating_add(estimate_tokens(message, count_thinking));
         if accumulated >= keep_recent_tokens {
             cut_index = *cut_points.last().unwrap();
             for &point in &cut_points {
@@ -584,11 +679,11 @@ mod tests {
             assistant_message(1_000, 2),
             user_message("12345678", 3), // 8 chars -> 2 trailing tokens
         ];
-        let estimate = estimate_context_tokens(&messages);
+        let estimate = estimate_context_tokens(&messages, false);
         assert_eq!(estimate.last_usage_index, Some(1));
         assert_eq!(estimate.tokens, 1_002);
         let messages = vec![user_message("12345678", 1)];
-        let estimate = estimate_context_tokens(&messages);
+        let estimate = estimate_context_tokens(&messages, false);
         assert_eq!(estimate.last_usage_index, None);
         assert_eq!(estimate.tokens, 2);
     }
@@ -608,19 +703,25 @@ mod tests {
             user_message("f14 threshold crossing turn", 3),
             assistant_message(126_010, 4),
         ];
-        assert!(threshold_compaction_due(&messages, 128_000, 0, &settings));
+        assert!(threshold_compaction_due(
+            &messages, 128_000, 0, &settings, false
+        ));
         let messages = vec![
             user_message("f14 auto seed turn", 1),
             assistant_message(110, 2),
         ];
-        assert!(!threshold_compaction_due(&messages, 128_000, 0, &settings));
+        assert!(!threshold_compaction_due(
+            &messages, 128_000, 0, &settings, false
+        ));
         let disabled = CompactionSettings {
             enabled: false,
             reserve_tokens: 127_500,
             keep_recent_tokens: 10,
         };
-        assert!(!threshold_compaction_due(&messages, 128_000, 0, &disabled));
-        assert!(!threshold_compaction_due(&messages, 0, 0, &settings));
+        assert!(!threshold_compaction_due(
+            &messages, 128_000, 0, &disabled, false
+        ));
+        assert!(!threshold_compaction_due(&messages, 0, 0, &settings, false));
     }
 
     #[test]
@@ -634,14 +735,14 @@ mod tests {
             assistant_message(1_017_457, 2),
         ];
         assert!(threshold_compaction_due(
-            &messages, 1_048_576, 32_000, &settings
+            &messages, 1_048_576, 32_000, &settings, false
         ));
         let messages = vec![
             user_message("live session turn", 1),
             assistant_message(990_000, 2),
         ];
         assert!(!threshold_compaction_due(
-            &messages, 1_048_576, 32_000, &settings
+            &messages, 1_048_576, 32_000, &settings, false
         ));
         // A 64k output budget pushes the combined ceiling below the percentage
         // one (1_048_576 - 65_536 - 16_384 = 966_656): 970_000 fires on the
@@ -651,10 +752,10 @@ mod tests {
             assistant_message(970_000, 2),
         ];
         assert!(threshold_compaction_due(
-            &messages, 1_048_576, 65_536, &settings
+            &messages, 1_048_576, 65_536, &settings, false
         ));
         assert!(!threshold_compaction_due(
-            &messages, 1_048_576, 0, &settings
+            &messages, 1_048_576, 0, &settings, false
         ));
     }
 
@@ -713,13 +814,17 @@ mod tests {
             user_message("kept turn", 5),
             assistant_message(126_010, 6),
         ];
-        assert!(!threshold_compaction_due(&messages, 128_000, 0, &settings));
+        assert!(!threshold_compaction_due(
+            &messages, 128_000, 0, &settings, false
+        ));
         let messages = vec![
             compaction_summary(10),
             user_message("new turn", 11),
             assistant_message(126_010, 12),
         ];
-        assert!(threshold_compaction_due(&messages, 128_000, 0, &settings));
+        assert!(threshold_compaction_due(
+            &messages, 128_000, 0, &settings, false
+        ));
     }
 
     #[test]
@@ -729,7 +834,7 @@ mod tests {
             timestamp: 0,
             rest: serde_json::Map::default(),
         });
-        assert_eq!(estimate_tokens(&user), 2);
+        assert_eq!(estimate_tokens(&user, true), 2);
         let usage = pa_types::ai::Usage {
             input: 10,
             output: 5,
@@ -792,10 +897,10 @@ mod tests {
             assistant_entry("a2", "u2"),
             user_entry("u3", "a2", "turn three"),
         ];
-        let keep_all = find_cut_point(&entries, 0, 5, 10_000);
+        let keep_all = find_cut_point(&entries, 0, 5, 10_000, false);
         assert_eq!(keep_all.first_kept_entry_index, 0);
         assert!(!keep_all.is_split_turn);
-        let keep_little = find_cut_point(&entries, 0, 5, 1);
+        let keep_little = find_cut_point(&entries, 0, 5, 1, false);
         assert!(keep_little.first_kept_entry_index > 0);
         assert!(!keep_little.is_split_turn);
 
@@ -806,7 +911,7 @@ mod tests {
             user_entry("u2", "a1", "turn two"),
             assistant_entry("a2", "u2"),
         ];
-        let keep_small = find_cut_point(&assistant_final, 0, 4, 1);
+        let keep_small = find_cut_point(&assistant_final, 0, 4, 1, false);
         assert!(keep_small.is_split_turn);
         assert_eq!(keep_small.turn_start_index, Some(2));
     }
@@ -831,7 +936,7 @@ mod tests {
                 "a2",
                 "a1",
                 AgentMessage::Assistant(pa_types::ai::AssistantMessage {
-                    content: vec![],
+                    content: Vec::new(),
                     api: "openai-completions".to_string(),
                     provider: "p".to_string(),
                     model: "m".to_string(),
@@ -856,5 +961,112 @@ mod tests {
         ];
         let usage = get_last_assistant_usage(&entries).unwrap();
         assert_eq!(usage.total_tokens, 150);
+    }
+
+    // --- issue #9: strip-aware estimation ---
+
+    fn thinking_assistant(thinking: &str, timestamp: u64) -> AgentMessage {
+        let mut message = assistant_message(0, timestamp);
+        let AgentMessage::Assistant(assistant) = &mut message else {
+            unreachable!()
+        };
+        assistant.content.insert(
+            0,
+            pa_types::ai::AssistantContentBlock::Thinking(pa_types::ai::ThinkingContent {
+                thinking: thinking.to_string(),
+                thinking_signature: None,
+                redacted: None,
+                rest: serde_json::Map::default(),
+            }),
+        );
+        message
+    }
+
+    #[test]
+    fn estimate_tokens_without_thinking_counts_thinking_as_zero() {
+        let message = thinking_assistant("0123456789", 1);
+        let with = estimate_tokens(&message, true);
+        let without = estimate_tokens(&message, false);
+        assert!(with > without);
+        // The thinking text (10 chars -> 2 tokens at chars/4) no longer counts.
+        assert_eq!(with - without, 2);
+    }
+
+    #[test]
+    fn estimate_context_tokens_strip_counts_only_current_chain_thinking() {
+        // The usage anchor is the last non-error assistant; the trailing
+        // estimate covers the errored thinking-heavy assistant (old turn)
+        // and the new user message. On a stripping route the errored
+        // assistant's thinking sits before the boundary user message and
+        // estimates as zero.
+        let mut errored = thinking_assistant(&"x".repeat(4_000), 3);
+        if let AgentMessage::Assistant(assistant) = &mut errored {
+            assistant.stop_reason = pa_types::ai::StopReason::Error;
+        }
+        let messages = vec![
+            user_message("turn one", 1),
+            assistant_message(1_000, 2),
+            errored,
+            user_message("turn two", 4),
+        ];
+        let full = estimate_context_tokens(&messages, false).tokens;
+        let stripped = estimate_context_tokens(&messages, true).tokens;
+        // The old turn's 4_000 thinking chars drop out; the boundary user
+        // message itself still counts on both sides.
+        assert_eq!(full - stripped, 4_000 / 4);
+    }
+
+    #[test]
+    fn becomes_user_message_matches_the_wire_conversion() {
+        use super::super::messages::becomes_user_message;
+        let messages = [
+            user_message("hi", 1),
+            thinking_assistant("think", 2),
+            AgentMessage::ToolResult(pa_types::ai::ToolResultMessage {
+                tool_call_id: "t".into(),
+                tool_name: "echo".into(),
+                content: vec![],
+                details: None,
+                is_error: false,
+                timestamp: 3,
+                rest: serde_json::Map::default(),
+            }),
+            AgentMessage::BashExecution(pa_types::session::BashExecutionMessage {
+                command: "ls".into(),
+                output: String::new(),
+                exit_code: Some(0),
+                cancelled: false,
+                truncated: false,
+                full_output_path: None,
+                exclude_from_context: Some(true),
+                timestamp: 4,
+            }),
+            AgentMessage::Custom(pa_types::session::CustomMessage {
+                custom_type: "session_slash_command".into(),
+                content: pa_types::ai::UserContent::Text("/x".into()),
+                display: false,
+                details: None,
+                timestamp: 5,
+                rest: serde_json::Map::default(),
+            }),
+            compaction_summary(6),
+        ];
+        // Per-message equivalence: `becomes_user_message` holds exactly when
+        // the message survives `convert_to_llm` and lands as a user-role
+        // message. The strip boundary derived on either side then agrees by
+        // construction.
+        for (index, message) in messages.iter().enumerate() {
+            let converted = super::super::messages::convert_to_llm(std::slice::from_ref(message));
+            let is_user_on_wire = converted.len() == 1 && becomes_user_message(&converted[0]);
+            assert_eq!(
+                becomes_user_message(message),
+                is_user_on_wire,
+                "message {index} disagrees with the wire conversion"
+            );
+        }
+        // The excluded bash and the filtered custom are dropped; the
+        // compaction summary is the last user-role message on the session side.
+        let session_boundary = messages.iter().rposition(becomes_user_message);
+        assert_eq!(session_boundary, Some(5));
     }
 }

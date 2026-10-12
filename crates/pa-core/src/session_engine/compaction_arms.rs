@@ -43,6 +43,7 @@ impl AgentSession {
                 provider_adapter::model_thinking_level(state.thinking_level),
             ),
             &self.compaction_settings(),
+            compaction::strips_prior_turn_reasoning(model),
         )
     }
 

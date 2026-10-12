@@ -478,7 +478,9 @@ fn compaction_request_skip_reason(
     entries: &[FileEntry],
     keep_recent_tokens: u64,
 ) -> Option<&'static str> {
-    prepare_compaction(entries, keep_recent_tokens)
+    // The skip reasons (AlreadyCompacted / TooShort) do not depend on
+    // the cut, so the strip flag is irrelevant here.
+    prepare_compaction(entries, keep_recent_tokens, false)
         .err()
         .map(CompactSkip::request_reason)
 }

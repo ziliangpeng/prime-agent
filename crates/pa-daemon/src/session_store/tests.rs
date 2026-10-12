@@ -1022,7 +1022,7 @@ fn durable_first_kept_entry_id_pins_the_boundary_the_read_retains() {
     session.append_message(&json!({"role": "user", "content": "second turn", "timestamp": 3u64}));
     session.append_message(&assistant("second turn done".to_string(), 4u64));
 
-    let durable_id = session.durable_first_kept_entry_id(5);
+    let durable_id = session.durable_first_kept_entry_id(5, false);
     // The cut keeps the whole second turn: its user message is the boundary (estimate: 4 + 2 >= 5
     // stops at the user entry).
     let kept = session

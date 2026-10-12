@@ -61,6 +61,7 @@ pub struct CompactionPreparation {
 pub fn prepare_compaction(
     entries: &[FileEntry],
     keep_recent_tokens: u64,
+    strip_prior_turn_reasoning: bool,
 ) -> Result<CompactionPreparation, CompactSkip> {
     if matches!(entries.last(), Some(FileEntry::Compaction { .. })) {
         return Err(CompactSkip::AlreadyCompacted);
@@ -87,7 +88,13 @@ pub fn prepare_compaction(
         }
         None => (start, None),
     };
-    let cut = find_cut_point(entries, boundary_start, entries.len(), keep_recent_tokens);
+    let cut = find_cut_point(
+        entries,
+        boundary_start,
+        entries.len(),
+        keep_recent_tokens,
+        strip_prior_turn_reasoning,
+    );
     let history_end = if cut.is_split_turn {
         cut.turn_start_index.unwrap_or(cut.first_kept_entry_index)
     } else {
@@ -121,10 +128,20 @@ pub fn prepare_compaction(
 
 /// The cut computed for a session (test seam for decision verification).
 #[must_use]
-pub fn compute_cut(session: &SessionManager, keep_recent_tokens: u64) -> (CutPointResult, u64) {
+pub fn compute_cut(
+    session: &SessionManager,
+    keep_recent_tokens: u64,
+    strip_prior_turn_reasoning: bool,
+) -> (CutPointResult, u64) {
     let entries = session.retained_entries();
     let start = usize::from(matches!(entries.first(), Some(FileEntry::Header { .. })));
-    let cut = find_cut_point(entries, start, entries.len(), keep_recent_tokens);
-    let tokens = context_tokens(entries, session.get_leaf_id());
+    let cut = find_cut_point(
+        entries,
+        start,
+        entries.len(),
+        keep_recent_tokens,
+        strip_prior_turn_reasoning,
+    );
+    let tokens = context_tokens(entries, session.get_leaf_id(), strip_prior_turn_reasoning);
     (cut, tokens)
 }
