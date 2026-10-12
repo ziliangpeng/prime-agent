@@ -419,7 +419,16 @@ pub fn load_custom_models(
                 .or_else(|| provider_config.base_url.clone())
                 .or_else(|| defaults.as_ref().map(|(_, url)| url.clone()));
             let Some(base_url) = base_url else { continue };
-            let compat = merge_compat(None, compat_from_value(provider_config.compat.as_ref()));
+            // Model-entry compat applies over provider compat (TS parity:
+            // model-registry.ts `mergeCompat(providerConfig.compat,
+            // modelDef.compat)`); `merge_compat` early-returns `None` when
+            // the override is `None`, so the absent-model-compat case keeps
+            // the provider compat.
+            let provider_compat = compat_from_value(provider_config.compat.as_ref());
+            let compat = match compat_from_value(model_def.compat.as_ref()) {
+                Some(model_compat) => merge_compat(provider_compat.as_ref(), Some(model_compat)),
+                None => provider_compat,
+            };
             result.models.push(Model {
                 id: model_def.id.clone(),
                 name: model_def
@@ -624,5 +633,52 @@ mod tests {
         assert_eq!(merged.context_window, 2000);
         assert_eq!(merged.cost.output.0, 9.0);
         assert_eq!(merged.cost.input.0, 1.0);
+    }
+
+    /// Issue #9 port-gap fix: an inline model-entry `compat` applies over the
+    /// provider-level compat (TS `mergeCompat(providerConfig.compat,
+    /// modelDef.compat)`), and a provider compat survives when the model
+    /// entry has none.
+    #[test]
+    fn inline_model_compat_applies_over_provider_compat() {
+        let result = load_custom_models(
+            r#"{ "providers": { "midagent": {
+                "baseUrl": "http://127.0.0.1:9",
+                "apiKey": "sk-local",
+                "api": "openai-completions",
+                "compat": { "supportsStore": false },
+                "models": [
+                    { "id": "glm", "reasoning": true,
+                      "compat": { "stripPriorTurnReasoning": true } },
+                    { "id": "plain", "reasoning": false }
+                ]
+            } } }"#,
+            &|_| false,
+            &|_| None,
+        );
+        assert!(result.error.is_none());
+        let glm = result.models.iter().find(|m| m.id == "glm").expect("glm");
+        let plain = result
+            .models
+            .iter()
+            .find(|m| m.id == "plain")
+            .expect("plain");
+
+        // Model-entry compat applied over the provider compat: both keys.
+        let compat = glm.compat.as_ref().expect("glm compat");
+        let raw = &compat.raw;
+        assert_eq!(
+            raw.get("stripPriorTurnReasoning"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(raw.get("supportsStore"), Some(&serde_json::json!(false)));
+
+        // Provider compat survives when the model entry has none.
+        let compat = plain.compat.as_ref().expect("plain keeps provider compat");
+        assert_eq!(
+            compat.raw.get("supportsStore"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(compat.raw.get("stripPriorTurnReasoning").is_none());
     }
 }
